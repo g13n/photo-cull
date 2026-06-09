@@ -1,0 +1,6 @@
+opencv-python
+imagehash
+requests
+Pillow
+rawpy
+numpy
