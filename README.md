@@ -76,9 +76,8 @@ While the script is running you can watch progress in a second terminal.
 Keepers are copied to the output directory (default: `keepers/` under the input
 directory). A CSV report is written progressively with one row per image.
 
-+--------------------+--------------------------------------------------------+
 | **Field**          | **Description**                                        |
-+--------------------+-------------------------------------------------------0+
+|:-------------------|:-------------------------------------------------------|
 | filename           | Original filename                                      |
 | cluster_id         | Burst cluster the image belongs to                     |
 | blur_score         | Laplacian variance score - lower means blurrier        |
@@ -86,12 +85,11 @@ directory). A CSV report is written progressively with one row per image.
 | is_duplicate       | True if near-duplicate of another image in the cluster |
 | keeper             | True if selected as the keeper                         |
 | reason             | Reason for keeping or discarding                       |
-+--------------------+--------------------------------------------------------+
 
 ## Tested on
 
 * Apple M2 Max, 64GB unified memory, macOS
-* 166 RAW files (Canon CR2) processed in ~5 minutes
+* 166 RAW files (Canon CR2) processed in ~6 minutes
 
 ## RAW formats supported
 
