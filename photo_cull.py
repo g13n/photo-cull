@@ -79,7 +79,7 @@ def get_timestamp(path: Path) -> datetime:
     """
     Extract DateTimeOriginal from EXIF using exiftool.
 
-    Falls back to file modification time if not found.
+    Falls back to file modification time if not found and prints a warning.
     """
     try:
         result = subprocess.run(
@@ -91,17 +91,29 @@ def get_timestamp(path: Path) -> datetime:
             return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
     except Exception:
         pass
+
+    print(f"Warning: Could not read EXIF for {path.name}. Falling back to file modification time.")
     return datetime.fromtimestamp(path.stat().st_mtime)
 
 
 def load_image(path: Path) -> Image.Image:
-    """Load a JPEG or RAW file and return a resized PIL Image."""
+    """Load a JPEG or extract a RAW thumbnail and return a resized PIL Image."""
     if path.suffix.lower() in RAW_EXTENSIONS:
         with rawpy.imread(str(path)) as raw:
-            rgb = raw.postprocess(use_camera_wb=True)
-        img = Image.fromarray(rgb)
+            try:
+                # Extract the instant preview
+                thumb = raw.extract_thumb()
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    img = Image.open(BytesIO(thumb.data))
+                else:
+                    img = Image.fromarray(thumb.data)
+            except rawpy.LibRawNoThumbnailError:
+                # Fallback to slow decode only if no preview exists
+                rgb = raw.postprocess(use_camera_wb=True)
+                img = Image.fromarray(rgb)
     else:
         img = Image.open(path).convert("RGB")
+
     img.thumbnail((MAX_IMAGE_SIZE, MAX_IMAGE_SIZE))
     return img
 
@@ -201,9 +213,9 @@ def pick_keeper(paths: list[Path], images: dict[Path, Image.Image],
     question = (
         f"You are given {len(paths)} photos from a burst sequence:\n{numbered}\n\n"
         f"Examine each photo carefully and pick the single best keeper using these criteria in order:\n"
-        f"1. The subject must be fully in frame — avoid photos where the animal is cut off at the edges\n"
-        f"2. Sharpness of the subject's eye and facial features\n"
-        f"3. Overall clarity and composition\n\n"
+        f"1. The subject must be fully in frame. Avoid photos where the animal is cut off at the edges.\n"
+        f"2. Sharpness of the subject's eye and facial features.\n"
+        f"3. Overall clarity and composition.\n\n"
         f"If all photos have the subject cut off, pick the one with the sharpest eye.\n\n"
         f"Respond with exactly the filename and one sentence explaining why. "
         f"Example: IMG_0468.jpeg - subject fully in frame with sharpest eye detail."
@@ -249,24 +261,13 @@ def pick_keeper(paths: list[Path], images: dict[Path, Image.Image],
     except Exception as e:
         return "model_error", str(e)
 
+
 def resolve_paths(args) -> tuple[Path, Path, Path]:
     """Resolve input, output, and report paths from args, applying defaults."""
     input_dir = Path(args.input)
     output_dir = Path(args.output) if args.output else input_dir / DEFAULT_OUTPUT_DIR
     report_path = Path(args.report) if args.report else input_dir / DEFAULT_OUTPUT_DIR / DEFAULT_REPORT_FILE
     return input_dir, output_dir, report_path
-
-
-def cache_and_score(images_ts: list[tuple[Path, datetime]]
-                    ) -> tuple[dict[Path, Image.Image], dict[Path, float]]:
-    """Load every image into memory and compute its blur score."""
-    image_cache: dict[Path, Image.Image] = {}
-    blur_scores: dict[Path, float] = {}
-    for path, _ in images_ts:
-        img = load_image(path)
-        image_cache[path] = img
-        blur_scores[path] = blur_score(img)
-    return image_cache, blur_scores
 
 
 def write_row(writer, csvfile, *, filename, cluster_id, blur_score,
@@ -299,21 +300,35 @@ def process_duplicate_group(group, cluster_id, blur_scores, image_cache,
     print(f"  duplicate group of {len(group)}, asking model...")
     chosen, reason = pick_keeper(group, image_cache, args.model, args.llama_server)
 
+    # Fallback if the AI model fails
+    if chosen == "model_error":
+        print(f"  model failed (reason: {reason}), falling back to highest blur score")
+        best_path = max(group, key=lambda p: blur_scores[p])
+        chosen = best_path.name
+        reason = "model failed, fallback to sharpest image"
+
     for path in group:
         is_keeper = (path.name == chosen)
         if is_keeper:
             shutil.copy2(path, output_dir / path.name)
             print(f"  cluster: {[p.name for p in group]}")
-            print(f"  keeper: {path.name} — {reason}")
+            print(f"  keeper: {path.name} (reason: {reason})")
         write_row(writer, csvfile, filename=path.name, cluster_id=cluster_id,
                   blur_score=blur_scores[path], is_blurry=False, is_duplicate=True,
                   keeper=is_keeper, reason=reason if is_keeper else "duplicate")
 
 
-def process_cluster(cluster, cluster_id, total, blur_scores, image_cache,
-                    output_dir, writer, csvfile, args):
+def process_cluster(cluster, cluster_id, total, output_dir, writer, csvfile, args):
     """Process one burst cluster end to end."""
     print(f"\ncluster {cluster_id}/{total}: {len(cluster)} image(s)")
+
+    # Load images and calculate scores just for this specific cluster
+    image_cache = {}
+    blur_scores = {}
+    for path in cluster:
+        img = load_image(path)
+        image_cache[path] = img
+        blur_scores[path] = blur_score(img)
 
     sharp = [p for p in cluster if blur_scores[p] >= args.blur_threshold]
     blurry = [p for p in cluster if blur_scores[p] < args.blur_threshold]
@@ -341,6 +356,10 @@ def process_cluster(cluster, cluster_id, total, blur_scores, image_cache,
         process_duplicate_group(group, cluster_id, blur_scores, image_cache,
                                 output_dir, writer, csvfile, args)
 
+    # Free up memory explicitly before moving to the next cluster
+    image_cache.clear()
+    blur_scores.clear()
+
 
 def process(args):
     input_dir, output_dir, report_path = resolve_paths(args)
@@ -360,9 +379,6 @@ def process(args):
         sys.exit(1)
     print(f"found {len(images_ts)} images")
 
-    print("loading images and computing blur scores...")
-    image_cache, blur_scores = cache_and_score(images_ts)
-
     print("clustering bursts...")
     clusters = cluster_bursts(images_ts, args.burst_gap)
     print(f"found {len(clusters)} clusters")
@@ -376,8 +392,8 @@ def process(args):
         csvfile.flush()
 
         for i, cluster in enumerate(clusters):
-            process_cluster(cluster, i + 1, len(clusters), blur_scores,
-                            image_cache, output_dir, writer, csvfile, args)
+            # Pass only what is needed to process the current cluster
+            process_cluster(cluster, i + 1, len(clusters), output_dir, writer, csvfile, args)
 
     print(f"\ndone. keepers copied to {output_dir}")
     print(f"report written to {report_path}")
